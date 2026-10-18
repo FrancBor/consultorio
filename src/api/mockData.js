@@ -1,7 +1,5 @@
-// Datos de prueba (mock) — respetan EXACTAMENTE la forma del contrato de
-// API definido en la hoja de ruta de desarrollo (resumen + serie).
-// Cuando el backend esté listo, client.js reemplaza estos datos por
-// llamadas reales a axios sin tocar ningún componente.
+// Referencia histórica del prototipo. El dashboard real no importa este archivo:
+// sus indicadores y detalle provienen de la API PostgreSQL mediante client.js.
 
 const PERIODOS = ['2026-04', '2026-05', '2026-06', '2026-07', '2026-08', '2026-09']
 

@@ -1,90 +1,360 @@
-import { useState } from 'react'
-
-const USUARIOS_MOCK = [
-  { nombre: 'Director/a CESFAM', usuario: 'direccion', rol: 'consulta' },
-  { nombre: 'Encargado/a SOME', usuario: 'some', rol: 'consulta' },
-  { nombre: 'Coordinador/a de box', usuario: 'coordinacion', rol: 'consulta' },
-  { nombre: 'Equipo de gestión', usuario: 'gestion', rol: 'consulta' },
-  { nombre: 'Administrador del sistema', usuario: 'admin', rol: 'admin' },
-]
-
-const ROL_BADGE = {
-  admin: 'bg-warn-100 text-warn-600',
-  consulta: 'bg-brand-50 text-brand-700',
-}
+import { useCallback, useEffect, useRef, useState } from 'react'
+import {
+  createAdminUser,
+  isAdminUsersAuthenticationError,
+  isAdminUsersForbiddenError,
+  isAdminUsersRequestCanceled,
+  listAdminUsers,
+  resetAdminUserPassword,
+  updateAdminUser,
+} from '../api/admin-users.js'
+import { useAuth } from '../auth/AuthContext.jsx'
+import DataImportPanel from '../components/admin/DataImportPanel.jsx'
+import UserCreateForm from '../components/admin/UserCreateForm.jsx'
+import UserManagementPanel from '../components/admin/UserManagementPanel.jsx'
+import UsersTable from '../components/admin/UsersTable.jsx'
+import {
+  createAdminUsersQuery,
+  INITIAL_ADMIN_USERS_FILTERS,
+} from './admin-users-state.js'
 
 export default function Administracion() {
-  const [archivo, setArchivo] = useState(null)
+  const { user: currentUser, checkSession } = useAuth()
+  const initialQuery = createAdminUsersQuery(INITIAL_ADMIN_USERS_FILTERS)
+  const [draftFilters, setDraftFilters] = useState(INITIAL_ADMIN_USERS_FILTERS)
+  const [query, setQuery] = useState(initialQuery)
+  const [users, setUsers] = useState([])
+  const [meta, setMeta] = useState(null)
+  const [loading, setLoading] = useState(true)
+  const [listError, setListError] = useState(null)
+  const [pendingAction, setPendingAction] = useState(null)
+  const [feedback, setFeedback] = useState(null)
+  const [selection, setSelection] = useState(null)
+  const mountedRef = useRef(false)
+  const listRequestRef = useRef({ sequence: 0, controller: null })
+  const mutationRef = useRef(null)
+  const queryRef = useRef(initialQuery)
+  const feedbackRef = useRef(null)
+
+  const revalidateAccess = useCallback(async (error) => {
+    if (!isAdminUsersAuthenticationError(error) && !isAdminUsersForbiddenError(error)) return
+    await checkSession({ blocking: true }).catch(() => {})
+  }, [checkSession])
+
+  const revalidateImportAccess = useCallback(async (error) => {
+    await revalidateAccess(error)
+  }, [revalidateAccess])
+
+  const loadUsers = useCallback(async (requestedQuery) => {
+    listRequestRef.current.controller?.abort()
+    const controller = new AbortController()
+    const sequence = listRequestRef.current.sequence + 1
+    listRequestRef.current = { sequence, controller }
+    setLoading(true)
+    setListError(null)
+
+    try {
+      const result = await listAdminUsers(requestedQuery, { signal: controller.signal })
+      if (!mountedRef.current || listRequestRef.current.sequence !== sequence) return
+
+      if (result.meta.totalPages > 0 && requestedQuery.page > result.meta.totalPages) {
+        const corrected = createAdminUsersQuery(requestedQuery, result.meta.totalPages)
+        queryRef.current = corrected
+        setQuery(corrected)
+        void loadUsers(corrected)
+        return
+      }
+
+      setUsers(result.users)
+      setMeta(result.meta)
+      setSelection((current) => {
+        if (!current) return null
+        const refreshed = result.users.find((item) => item.id === current.user.id)
+        return refreshed ? { ...current, user: refreshed } : null
+      })
+    } catch (error) {
+      if (
+        isAdminUsersRequestCanceled(error) ||
+        !mountedRef.current ||
+        listRequestRef.current.sequence !== sequence
+      ) {
+        return
+      }
+
+      setListError(error.message || 'No fue posible cargar las cuentas.')
+      await revalidateAccess(error)
+    } finally {
+      if (mountedRef.current && listRequestRef.current.sequence === sequence) setLoading(false)
+    }
+  }, [revalidateAccess])
+
+  useEffect(() => {
+    mountedRef.current = true
+    void loadUsers(initialQuery)
+
+    return () => {
+      mountedRef.current = false
+      listRequestRef.current.controller?.abort()
+      mutationRef.current?.controller.abort()
+    }
+  }, [loadUsers])
+
+  useEffect(() => {
+    if (feedback) feedbackRef.current?.focus()
+  }, [feedback])
+
+  async function runMutation(type, operation, successMessage, { endSession = false } = {}) {
+    if (mutationRef.current) return false
+
+    const controller = new AbortController()
+    mutationRef.current = { type, controller }
+    setPendingAction(type)
+    setFeedback(null)
+
+    try {
+      await operation(controller.signal)
+      if (!mountedRef.current) return false
+
+      setFeedback({ type: 'success', message: successMessage })
+      if (endSession) {
+        await checkSession({ blocking: true }).catch(() => {})
+      } else {
+        await loadUsers(queryRef.current)
+      }
+      return true
+    } catch (error) {
+      if (isAdminUsersRequestCanceled(error) || !mountedRef.current) return false
+
+      setFeedback({
+        type: 'error',
+        message: error.message || 'No fue posible completar la operación.',
+      })
+      await revalidateAccess(error)
+      return false
+    } finally {
+      if (mutationRef.current?.controller === controller) {
+        mutationRef.current = null
+        if (mountedRef.current) setPendingAction(null)
+      }
+    }
+  }
+
+  async function handleCreate(input) {
+    return runMutation(
+      'create',
+      (signal) => createAdminUser(input, { signal }),
+      'La cuenta fue creada correctamente.',
+    )
+  }
+
+  async function handleUpdate(target, patch) {
+    const updated = await runMutation(
+      'update',
+      (signal) => updateAdminUser(target.id, patch, { signal }),
+      'La cuenta fue actualizada correctamente.',
+    )
+    if (updated && mountedRef.current) setSelection(null)
+    return updated
+  }
+
+  async function handlePasswordReset(target, password) {
+    const isCurrent = String(target.id) === String(currentUser.id)
+    const reset = await runMutation(
+      'password',
+      (signal) => resetAdminUserPassword(target.id, password, { signal }),
+      isCurrent
+        ? 'La contraseña fue actualizada. Debe iniciar sesión nuevamente.'
+        : 'La contraseña fue actualizada y las sesiones de la cuenta fueron revocadas.',
+      { endSession: isCurrent },
+    )
+    if (reset && mountedRef.current && !isCurrent) setSelection(null)
+    return reset
+  }
+
+  function applyFilters(event) {
+    event.preventDefault()
+    if (loading || busy) return
+
+    const nextQuery = createAdminUsersQuery(draftFilters, 1)
+    queryRef.current = nextQuery
+    setQuery(nextQuery)
+    void loadUsers(nextQuery)
+  }
+
+  function changePage(page) {
+    if (loading || busy) return
+
+    const nextQuery = createAdminUsersQuery(query, page)
+    queryRef.current = nextQuery
+    setQuery(nextQuery)
+    void loadUsers(nextQuery)
+  }
+
+  const busy = pendingAction !== null
+
+  function updateDraftFilter(field, value) {
+    if (loading || busy) return
+    setDraftFilters((current) => ({ ...current, [field]: value }))
+  }
+
+  function refreshUsers() {
+    if (loading || busy) return
+    void loadUsers(queryRef.current)
+  }
+
+  function selectUser(selectedUser, mode) {
+    if (loading || busy) return
+    setSelection({ user: selectedUser, mode })
+  }
+
+  function closeSelection() {
+    if (busy) return
+    setSelection(null)
+  }
 
   return (
     <div className="flex flex-col gap-6">
-      <div className="rounded-xl bg-white border border-slate-200 shadow-sm">
-        <div className="px-5 py-4 border-b border-slate-100">
-          <h2 className="text-sm font-semibold text-slate-700">Usuarios del sistema</h2>
-          <p className="text-xs text-slate-500 mt-0.5">Gestión de cuentas y niveles de acceso</p>
-        </div>
-        <div className="overflow-x-auto">
-          <table className="w-full text-sm">
-            <thead>
-              <tr className="text-left text-xs uppercase tracking-wide text-slate-400 border-b border-slate-100">
-                <th className="px-5 py-2 font-medium">Nombre</th>
-                <th className="px-5 py-2 font-medium">Usuario</th>
-                <th className="px-5 py-2 font-medium">Rol</th>
-              </tr>
-            </thead>
-            <tbody>
-              {USUARIOS_MOCK.map((u) => (
-                <tr key={u.usuario} className="border-b border-slate-50 last:border-0">
-                  <td className="px-5 py-2.5 text-slate-700">{u.nombre}</td>
-                  <td className="px-5 py-2.5 text-slate-700 font-mono text-xs">{u.usuario}</td>
-                  <td className="px-5 py-2.5">
-                    <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ${ROL_BADGE[u.rol]}`}>
-                      {u.rol === 'admin' ? 'Administrador' : 'Consulta'}
-                    </span>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      </div>
-
-      <div className="rounded-xl bg-white border border-slate-200 shadow-sm p-5">
-        <h2 className="text-sm font-semibold text-slate-700">Carga de datos</h2>
-        <p className="text-xs text-slate-500 mt-0.5 mb-4">
-          Actualizar el dataset que alimenta el Dashboard (CSV/JSON)
+      <header>
+        <h2 className="text-xl font-semibold text-slate-900">Administración de usuarios</h2>
+        <p className="mt-1 text-sm text-slate-600">
+          Cree cuentas y controle sus roles, estado y credenciales de acceso.
         </p>
+      </header>
 
-        <label
-          htmlFor="carga-dataset"
-          className="flex flex-col items-center justify-center gap-2 rounded-lg border-2 border-dashed border-slate-300 px-4 py-8 text-center cursor-pointer transition-colors duration-200 hover:border-brand-600 hover:bg-brand-50 focus-within:ring-2 focus-within:ring-brand-600"
+      {feedback && (
+        <p
+          ref={feedbackRef}
+          tabIndex={-1}
+          role={feedback.type === 'error' ? 'alert' : 'status'}
+          className={`rounded-xl border px-4 py-3 text-sm ${
+            feedback.type === 'error'
+              ? 'border-critical-100 bg-white text-critical-600'
+              : 'border-brand-100 bg-brand-50 text-brand-700'
+          }`}
         >
-          <span className="text-sm font-medium text-slate-700">
-            {archivo ? archivo.name : 'Selecciona un archivo CSV o JSON'}
-          </span>
-          <span className="text-xs text-slate-400">o arrástralo aquí</span>
-          <input
-            id="carga-dataset"
-            type="file"
-            accept=".csv,.json"
-            className="sr-only"
-            onChange={(e) => setArchivo(e.target.files?.[0] ?? null)}
-          />
-        </label>
-
-        <button
-          type="button"
-          disabled={!archivo}
-          className="mt-4 inline-flex items-center rounded-lg bg-brand-600 px-4 py-2 text-sm font-medium text-white transition-colors duration-200 hover:bg-brand-700 disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer focus-visible:ring-2 focus-visible:ring-brand-700 focus-visible:ring-offset-2"
-        >
-          Cargar dataset
-        </button>
-
-        <p className="mt-3 text-xs text-slate-400">
-          Este botón queda conectado a <code className="font-mono">POST /api/admin/datos</code> en el Sprint 3 —
-          por ahora solo valida la selección del archivo.
+          {feedback.message}
         </p>
-      </div>
+      )}
+
+      <UserCreateForm disabled={busy} onCreate={handleCreate} />
+
+      <section aria-labelledby="users-list-title">
+        <div className="mb-4 flex flex-wrap items-end justify-between gap-4">
+          <div>
+            <h2 id="users-list-title" className="text-base font-semibold text-slate-800">
+              Cuentas del sistema
+            </h2>
+            <p className="mt-1 text-sm text-slate-600">El usuario de acceso no puede modificarse.</p>
+          </div>
+          <button
+            type="button"
+            onClick={refreshUsers}
+            disabled={loading || busy}
+            className="min-h-11 rounded-lg border border-slate-300 px-3 py-2 text-sm font-medium text-slate-700 transition-colors duration-200 hover:bg-slate-50 focus-visible:ring-2 focus-visible:ring-brand-600 disabled:cursor-not-allowed disabled:opacity-50 cursor-pointer"
+          >
+            Actualizar listado
+          </button>
+        </div>
+
+        <form
+          onSubmit={applyFilters}
+          className="mb-4 grid grid-cols-1 gap-3 rounded-xl border border-slate-200 bg-white p-4 shadow-sm md:grid-cols-[1fr_auto_auto_auto] md:items-end"
+          aria-label="Filtros de cuentas"
+        >
+          <div>
+            <label htmlFor="user-search" className="block text-sm font-medium text-slate-700">
+              Buscar
+            </label>
+            <input
+              id="user-search"
+              type="search"
+              value={draftFilters.search}
+              onChange={(event) => updateDraftFilter('search', event.target.value)}
+              placeholder="Usuario, nombre o correo"
+              maxLength={150}
+              disabled={loading || busy}
+              className="mt-1 min-h-11 w-full rounded-lg border border-slate-300 px-3 py-2 text-base text-slate-800 disabled:cursor-not-allowed disabled:bg-slate-100"
+            />
+          </div>
+          <div>
+            <label htmlFor="user-role-filter" className="block text-sm font-medium text-slate-700">
+              Rol
+            </label>
+            <select
+              id="user-role-filter"
+              value={draftFilters.role}
+              onChange={(event) => updateDraftFilter('role', event.target.value)}
+              disabled={loading || busy}
+              className="mt-1 min-h-11 rounded-lg border border-slate-300 bg-white px-3 py-2 text-base text-slate-800 disabled:cursor-not-allowed disabled:bg-slate-100"
+            >
+              <option value="">Todos</option>
+              <option value="admin">Administrador</option>
+              <option value="consulta">Consulta</option>
+            </select>
+          </div>
+          <div>
+            <label htmlFor="user-active-filter" className="block text-sm font-medium text-slate-700">
+              Estado
+            </label>
+            <select
+              id="user-active-filter"
+              value={draftFilters.active}
+              onChange={(event) => updateDraftFilter('active', event.target.value)}
+              disabled={loading || busy}
+              className="mt-1 min-h-11 rounded-lg border border-slate-300 bg-white px-3 py-2 text-base text-slate-800 disabled:cursor-not-allowed disabled:bg-slate-100"
+            >
+              <option value="">Todos</option>
+              <option value="true">Activas</option>
+              <option value="false">Inactivas</option>
+            </select>
+          </div>
+          <button
+            type="submit"
+            disabled={loading || busy}
+            className="min-h-11 rounded-lg bg-brand-600 px-4 py-2.5 text-sm font-medium text-white transition-colors duration-200 hover:bg-brand-700 focus-visible:ring-2 focus-visible:ring-brand-700 focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-60 cursor-pointer"
+          >
+            Aplicar filtros
+          </button>
+        </form>
+
+        {listError && (
+          <div className="mb-4 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-critical-100 bg-white px-4 py-3 text-sm text-critical-600" role="alert">
+            <span>{listError}</span>
+            <button
+              type="button"
+              onClick={refreshUsers}
+              disabled={loading || busy}
+              className="min-h-11 rounded-lg bg-critical-600 px-4 py-2 font-medium text-white transition-opacity duration-200 hover:opacity-90 focus-visible:ring-2 focus-visible:ring-critical-600 focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50 cursor-pointer"
+            >
+              Reintentar
+            </button>
+          </div>
+        )}
+
+        <UsersTable
+          users={users}
+          meta={meta}
+          loading={loading}
+          busy={busy}
+          currentUserId={currentUser.id}
+          onSelect={selectUser}
+          onPageChange={changePage}
+        />
+      </section>
+
+      {selection && (
+        <UserManagementPanel
+          user={selection.user}
+          mode={selection.mode}
+          currentUserId={currentUser.id}
+          disabled={busy}
+          onClose={closeSelection}
+          onUpdate={handleUpdate}
+          onResetPassword={handlePasswordReset}
+        />
+      )}
+
+      <DataImportPanel onAccessError={revalidateImportAccess} />
     </div>
   )
 }

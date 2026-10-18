@@ -1,74 +1,214 @@
-import { createContext, useContext, useState, useCallback } from 'react'
-
-// Autenticación de prototipo (sin backend todavía — Sprint 1/3 la reemplaza
-// por un login real contra /api/auth/login). Dos cuentas de demostración,
-// una por cada nivel de acceso definido en el informe (RNF02):
-//   - admin   -> rol "admin"    (Administrador del sistema)
-//   - usuario -> rol "consulta" (Director, SOME, Coordinador, Gestión)
-//
-// Las credenciales NO se hardcodean aquí: se leen desde variables de
-// entorno (.env, que está en .gitignore) para no exponerlas en el
-// repositorio. Ver .env.example para la plantilla. Si faltan (por ejemplo,
-// justo después de clonar el repo sin haber creado el .env), se usa un
-// valor de respaldo para que el prototipo siga siendo evaluable.
-const env = import.meta.env
-const CUENTAS_DEMO = {
-  [env.VITE_DEMO_ADMIN_USER ?? 'admin']: {
-    password: env.VITE_DEMO_ADMIN_PASS ?? 'admin',
-    nombre: 'Administrador del sistema',
-    rol: 'admin',
-  },
-  [env.VITE_DEMO_CONSULTA_USER ?? 'usuario']: {
-    password: env.VITE_DEMO_CONSULTA_PASS ?? 'clave123',
-    nombre: 'Usuario de consulta',
-    rol: 'consulta',
-  },
-}
-
-const SESSION_KEY = 'cesfam-dashboard-session'
+import {
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react'
+import {
+  getCurrentUser,
+  isAuthenticationRequiredError,
+  isAuthRequestCanceled,
+  login as loginRequest,
+  logout as logoutRequest,
+} from '../api/auth.js'
 
 const AuthContext = createContext(null)
 
 export function AuthProvider({ children }) {
-  const [user, setUser] = useState(() => {
-    try {
-      const raw = sessionStorage.getItem(SESSION_KEY)
-      return raw ? JSON.parse(raw) : null
-    } catch {
-      return null
+  const [user, setUser] = useState(null)
+  const [status, setStatus] = useState('checking')
+  const [sessionError, setSessionError] = useState(null)
+  const [sessionNotice, setSessionNotice] = useState(null)
+  const [pendingAction, setPendingAction] = useState(null)
+  const mountedRef = useRef(false)
+  const userRef = useRef(null)
+  const verificationRef = useRef(null)
+  const verificationSequenceRef = useRef(0)
+  const actionRef = useRef(null)
+
+  const updateSession = useCallback((nextUser, nextStatus) => {
+    userRef.current = nextUser
+    setUser(nextUser)
+    setStatus(nextStatus)
+  }, [])
+
+  const checkSession = useCallback(({ blocking = false } = {}) => {
+    if (actionRef.current) {
+      return actionRef.current.promise.then(() => userRef.current)
     }
-  })
+
+    const activeVerification = verificationRef.current
+
+    if (activeVerification && (!blocking || activeVerification.blocking)) {
+      return activeVerification.promise
+    }
+
+    activeVerification?.controller.abort()
+
+    const id = verificationSequenceRef.current + 1
+    verificationSequenceRef.current = id
+    const controller = new AbortController()
+
+    if (blocking) setStatus('checking')
+    setSessionError(null)
+
+    const promise = (async () => {
+      try {
+        const currentUser = await getCurrentUser({ signal: controller.signal })
+
+        if (!mountedRef.current || verificationRef.current?.id !== id) return null
+
+        const hadAuthenticatedUser = Boolean(userRef.current)
+        updateSession(currentUser, currentUser ? 'authenticated' : 'anonymous')
+        setSessionNotice(
+          !currentUser && hadAuthenticatedUser
+            ? 'La sesión expiró. Inicie sesión nuevamente.'
+            : null,
+        )
+        return currentUser
+      } catch (error) {
+        if (
+          isAuthRequestCanceled(error) ||
+          !mountedRef.current ||
+          verificationRef.current?.id !== id
+        ) {
+          return null
+        }
+
+        if (blocking) {
+          setSessionError(error.message)
+          setStatus('error')
+        }
+        throw error
+      } finally {
+        if (verificationRef.current?.id === id) verificationRef.current = null
+      }
+    })()
+
+    verificationRef.current = { id, controller, promise, blocking }
+    return promise
+  }, [updateSession])
+
+  useEffect(() => {
+    mountedRef.current = true
+    void checkSession({ blocking: true }).catch(() => {})
+
+    return () => {
+      mountedRef.current = false
+      verificationRef.current?.controller.abort()
+      actionRef.current?.controller.abort()
+      verificationRef.current = null
+      actionRef.current = null
+      verificationSequenceRef.current += 1
+    }
+  }, [checkSession])
 
   const login = useCallback((usuario, password) => {
-    const cuenta = CUENTAS_DEMO[usuario]
-    if (!cuenta || cuenta.password !== password) {
-      throw new Error('Usuario o contraseña incorrectos.')
-    }
-    const sesion = { usuario, nombre: cuenta.nombre, rol: cuenta.rol }
-    try {
-      sessionStorage.setItem(SESSION_KEY, JSON.stringify(sesion))
-    } catch {
-      // sessionStorage puede no estar disponible (modo privado); la sesión
-      // sigue funcionando en memoria durante la pestaña actual.
-    }
-    setUser(sesion)
-    return sesion
-  }, [])
+    if (actionRef.current) return actionRef.current.promise
+
+    verificationRef.current?.controller.abort()
+    verificationRef.current = null
+    verificationSequenceRef.current += 1
+
+    const controller = new AbortController()
+    setPendingAction('login')
+    setSessionError(null)
+    setSessionNotice(null)
+
+    const promise = (async () => {
+      try {
+        const authenticatedUser = await loginRequest(usuario, password, {
+          signal: controller.signal,
+        })
+
+        if (mountedRef.current) updateSession(authenticatedUser, 'authenticated')
+        return authenticatedUser
+      } catch (error) {
+        if (isAuthRequestCanceled(error)) return null
+
+        if (mountedRef.current) updateSession(null, 'anonymous')
+        throw error
+      } finally {
+        if (actionRef.current?.promise === promise) {
+          actionRef.current = null
+          if (mountedRef.current) setPendingAction(null)
+        }
+      }
+    })()
+
+    actionRef.current = { type: 'login', controller, promise }
+    return promise
+  }, [updateSession])
 
   const logout = useCallback(() => {
-    try {
-      sessionStorage.removeItem(SESSION_KEY)
-    } catch {
-      /* no-op */
-    }
-    setUser(null)
-  }, [])
+    if (actionRef.current) return actionRef.current.promise
 
-  return <AuthContext.Provider value={{ user, login, logout }}>{children}</AuthContext.Provider>
+    verificationRef.current?.controller.abort()
+    verificationRef.current = null
+    verificationSequenceRef.current += 1
+
+    const controller = new AbortController()
+    setPendingAction('logout')
+
+    const promise = (async () => {
+      try {
+        await logoutRequest({ signal: controller.signal })
+
+        if (mountedRef.current) {
+          updateSession(null, 'anonymous')
+          setSessionNotice(null)
+        }
+      } catch (error) {
+        if (isAuthRequestCanceled(error)) return
+
+        if (mountedRef.current && isAuthenticationRequiredError(error)) {
+          updateSession(null, 'anonymous')
+          setSessionNotice(error.message)
+        }
+        throw error
+      } finally {
+        if (actionRef.current?.promise === promise) {
+          actionRef.current = null
+          if (mountedRef.current) setPendingAction(null)
+        }
+      }
+    })()
+
+    actionRef.current = { type: 'logout', controller, promise }
+    return promise
+  }, [updateSession])
+
+  const value = useMemo(
+    () => ({
+      user,
+      status,
+      sessionError,
+      sessionNotice,
+      pendingAction,
+      checkSession,
+      login,
+      logout,
+    }),
+    [
+      user,
+      status,
+      sessionError,
+      sessionNotice,
+      pendingAction,
+      checkSession,
+      login,
+      logout,
+    ],
+  )
+
+  return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>
 }
 
 export function useAuth() {
-  const ctx = useContext(AuthContext)
-  if (!ctx) throw new Error('useAuth debe usarse dentro de <AuthProvider>')
-  return ctx
+  const context = useContext(AuthContext)
+  if (!context) throw new Error('useAuth debe usarse dentro de <AuthProvider>')
+  return context
 }

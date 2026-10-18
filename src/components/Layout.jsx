@@ -1,3 +1,5 @@
+import { useEffect, useRef, useState } from 'react'
+import { isAuthenticationRequiredError } from '../api/auth.js'
 import { useAuth } from '../auth/AuthContext.jsx'
 
 const TABS = [
@@ -8,6 +10,35 @@ const TABS = [
 export default function Layout({ view, onChangeView, children }) {
   const { user, logout } = useAuth()
   const tabsVisibles = TABS.filter((t) => !t.rolMinimo || t.rolMinimo === user.rol)
+  const [logoutError, setLogoutError] = useState(null)
+  const [cerrandoSesion, setCerrandoSesion] = useState(false)
+  const cerrandoRef = useRef(false)
+  const mountedRef = useRef(false)
+
+  useEffect(() => {
+    mountedRef.current = true
+    return () => {
+      mountedRef.current = false
+    }
+  }, [])
+
+  async function handleLogout() {
+    if (cerrandoRef.current) return
+
+    cerrandoRef.current = true
+    setCerrandoSesion(true)
+    setLogoutError(null)
+
+    try {
+      await logout()
+    } catch (error) {
+      if (!mountedRef.current || isAuthenticationRequiredError(error)) return
+
+      setLogoutError(error.message || 'No fue posible cerrar la sesión. Intente nuevamente.')
+      setCerrandoSesion(false)
+      cerrandoRef.current = false
+    }
+  }
 
   return (
     <div className="min-h-screen bg-slate-50">
@@ -29,13 +60,25 @@ export default function Layout({ view, onChangeView, children }) {
             </div>
             <button
               type="button"
-              onClick={logout}
-              className="text-sm font-medium text-slate-500 hover:text-critical-600 transition-colors duration-200 cursor-pointer focus-visible:ring-2 focus-visible:ring-brand-600 rounded px-1"
+              onClick={handleLogout}
+              disabled={cerrandoSesion}
+              className="min-h-11 text-sm font-medium text-slate-500 hover:text-critical-600 transition-colors duration-200 cursor-pointer focus-visible:ring-2 focus-visible:ring-brand-600 rounded px-2 disabled:cursor-not-allowed disabled:opacity-60"
             >
-              Cerrar sesión
+              {cerrandoSesion ? 'Cerrando sesión…' : 'Cerrar sesión'}
             </button>
           </div>
         </div>
+
+        {logoutError && (
+          <div className="mx-auto max-w-6xl px-6 pb-3">
+            <p
+              role="alert"
+              className="rounded-lg bg-critical-100 px-3 py-2 text-sm text-critical-600"
+            >
+              {logoutError}
+            </p>
+          </div>
+        )}
 
         {tabsVisibles.length > 1 && (
           <nav className="mx-auto max-w-6xl px-6 flex gap-1" aria-label="Secciones">
